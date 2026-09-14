@@ -2,6 +2,8 @@
 
 가상 자금으로 이동평균 교차 전략을 실행하는 Node.js 프로그램입니다. 별도 npm 패키지가 필요 없습니다.
 
+**웹 배포:** [Render 배포 및 로그인 안내](DEPLOY.md) · [Render에 배포하기](https://render.com/deploy?repo=https://github.com/stun1012/kiwoom-autotrader)
+
 **현재 구현 범위: 데모 자동매매, 키움 REST API 시세 조회를 이용한 로컬 모의매매, CSV 백테스트. 키움 모의투자 계좌 주문과 실계좌 주문은 구현하지 않았습니다.**
 
 ## 실행

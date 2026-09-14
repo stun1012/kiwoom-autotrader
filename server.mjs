@@ -3,32 +3,36 @@ import { readFile, mkdir, appendFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { Engine, parseCSV } from './engine.mjs';
 import { Kiwoom } from './kiwoom.mjs';
+import { webConfig, createAuth } from './web-security.mjs';
 
 try { process.loadEnvFile(fileURLToPath(new URL('./.env', import.meta.url))); } catch (err) { if (err.code !== 'ENOENT') throw err; }
 const kiwoom = new Kiwoom();
+const web = webConfig();
+const auth = createAuth(web);
 let source = 'demo', symbol = '005930', nextPoll = 0, lastVolume = null;
 let volumeTop = 20, leaders = [], rankingAt = null, eligible = false;
 
 const html = await readFile(new URL('./index.html', import.meta.url));
+const loginHTML = await readFile(new URL('./login.html', import.meta.url));
 const volumeUI = await readFile(new URL('./volume-ui.js', import.meta.url));
 const dataDir = new URL('./data/', import.meta.url);
 await mkdir(dataDir, { recursive: true });
 let engine = new Engine(), running = false, ticks = 0, lastError = '';
 let seed = 42, price = 70000;
-const port = Number(process.env.PORT || 8765);
-const origin = `http://127.0.0.1:${port}`;
+const { port, origin } = web;
 async function log(trades) {
   for (const t of trades) await appendFile(new URL('trades.jsonl', dataDir), JSON.stringify({ ...t, mode: source + '-paper', symbol: source === 'demo' ? 'DEMO-KR' : symbol, recordedAt: new Date().toISOString() }) + '\n');
 }
 function state() { return { ...engine.snapshot(), running, lastError, mode: source === 'demo' ? '가상 시세 · 로컬 모의매매' : '키움 시세 · 로컬 모의매매', symbol: source === 'demo' ? 'DEMO-KR' : symbol, ticks,
+  authEnabled: auth.enabled, hosted: web.production,
   volumeFilter: { top: volumeTop, active: source === 'kiwoom', eligible, leaders, updatedAt: rankingAt } }; }
 function reply(res, status, data, type = 'application/json; charset=utf-8') {
   res.writeHead(status, { 'Content-Type': type, 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'" });
   res.end(typeof data === 'string' || Buffer.isBuffer(data) ? data : JSON.stringify(data));
 }
-async function body(req) {
+async function body(req, limit = 5e6) {
   const chunks = []; let size = 0;
-  for await (const chunk of req) { size += chunk.length; if (size > 5e6) throw new Error('업로드는 5MB 이하로 제한됩니다.'); chunks.push(chunk); }
+  for await (const chunk of req) { size += chunk.length; if (size > limit) throw new Error('요청 데이터 크기 제한을 초과했습니다.'); chunks.push(chunk); }
   return JSON.parse(Buffer.concat(chunks).toString() || '{}');
 }
 let busy = false;
@@ -68,8 +72,23 @@ async function tick() {
 }
 setInterval(tick, 1000).unref();
 http.createServer(async (req, res) => {
-  if (req.headers.host !== `127.0.0.1:${port}`) return reply(res, 403, { error: '허용되지 않은 호스트' });
+  // Health probes contain no account information and may use an internal host.
+  if (req.method === 'GET' && req.url === '/healthz') return reply(res, 200, { status: 'ok' });
+  if (req.headers.host !== web.allowedHost) return reply(res, 403, { error: '허용되지 않은 호스트' });
   try {
+    if (req.method === 'POST' && (req.headers.origin !== origin || !req.headers['content-type']?.startsWith('application/json'))) return reply(res, 403, { error: '현재 사이트에서만 조작할 수 있습니다.' });
+    if (req.method === 'POST' && req.url === '/api/login') {
+      const result = auth.login((await body(req, 4096)).password);
+      if (result.cookie) res.setHeader('Set-Cookie', result.cookie);
+      return reply(res, result.status, result.error ? { error: result.error } : { ok: true });
+    }
+    if (req.method === 'POST' && req.url === '/api/logout') {
+      res.setHeader('Set-Cookie', auth.logout(req)); return reply(res, 200, { ok: true });
+    }
+    if (!auth.authorized(req)) {
+      if (req.method === 'GET' && (req.url === '/' || req.url === '/login')) return reply(res, 200, loginHTML, 'text/html; charset=utf-8');
+      return reply(res, 401, { error: '로그인이 필요합니다.' });
+    }
     if (req.method === 'GET' && req.url === '/') return reply(res, 200, html, 'text/html; charset=utf-8');
     if (req.method === 'GET' && req.url === '/volume-ui.js') return reply(res, 200, volumeUI, 'text/javascript; charset=utf-8');
     if (req.method === 'GET' && req.url === '/api/state') return reply(res, 200, state());
@@ -80,7 +99,6 @@ http.createServer(async (req, res) => {
       return reply(res, 200, '\uFEFF' + [header, ...lines].join('\r\n'), 'text/csv; charset=utf-8');
     }
     if (req.method !== 'POST') return reply(res, 404, { error: '찾을 수 없습니다.' });
-    if (req.headers.origin !== origin || !req.headers['content-type']?.startsWith('application/json')) return reply(res, 403, { error: '로컬 대시보드에서만 조작할 수 있습니다.' });
     const input = await body(req);
     if (req.url === '/api/stop') { running = false; return reply(res, 200, state()); }
     if (busy) return reply(res, 409, { error: '시세 조회 또는 체결 기록 저장 중입니다. 잠시 후 다시 시도하세요.' });
@@ -104,4 +122,4 @@ http.createServer(async (req, res) => {
     } else return reply(res, 404, { error: '찾을 수 없습니다.' });
     reply(res, 200, state());
   } catch (err) { reply(res, 400, { error: err.message }); }
-}).listen(port, '127.0.0.1', () => console.log(`KR AutoTrader: ${origin}\n실제 주문 없음. 가상 시세를 사용하는 모의매매입니다.\n매매 기록: ${fileURLToPath(dataDir)}`));
+}).listen(port, web.host, () => console.log(`KR AutoTrader: ${origin}\n로그인 보호: ${auth.enabled ? '사용' : '로컬 전용, 미사용'}\n실제 주문 없음. 가상 시세를 사용하는 모의매매입니다.\n매매 기록: ${fileURLToPath(dataDir)}`));

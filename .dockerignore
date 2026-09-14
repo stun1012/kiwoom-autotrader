@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!package.json
+!server.mjs
+!engine.mjs
+!kiwoom.mjs
+!web-security.mjs
+!index.html
+!volume-ui.js
+!login.html
